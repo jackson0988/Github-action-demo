@@ -1,0 +1,30 @@
+[project]
+name = "taxi-class-5"
+version = "0.5.0"
+requires-python = ">=3.10"
+dependencies = [
+    "scikit-learn==1.7.1",
+    "pandas==2.2.3",
+    "mlflow==3.17.2",
+    "fastapi==0.115.12",
+    "uvicorn==0.34.2",
+]
+
+[project.optional-dependencies]
+# Needed for monitoring on your laptop, but not inside the API image or CI
+monitor = [
+    "evidently==0.7.23",
+]
+# Needed to run the tests
+test = [
+    "pytest==8.3.5",
+    "httpx==0.28.1",
+]
+
+# No Python package to build, we only need the dependencies
+[tool.setuptools]
+py-modules = []
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]

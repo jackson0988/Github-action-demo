@@ -1,0 +1,66 @@
+name: Predict a trip
+
+# Adds a "Run workflow" button on the Actions tab, with a form for the trip
+on:
+  workflow_dispatch:
+    inputs:
+      pickup:
+        description: "Pickup zone (1 to 265)"
+        default: "74"
+      dropoff:
+        description: "Drop-off zone (1 to 265)"
+        default: "75"
+      distance:
+        description: "Distance in miles"
+        default: "2.5"
+      hour:
+        description: "Hour of the day (0 to 23)"
+        default: "8"
+      weekday:
+        description: "Day (0 is Monday, 6 is Sunday)"
+        default: "1"
+
+permissions:
+  contents: read
+  actions: read # to download the model from the CI workflow
+
+jobs:
+  predict:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.10"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - run: pip install .
+
+      # Use the model from the newest green CI run on main: the model that passed the check
+      - name: Find the newest green CI run
+        id: ci
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          run_id=$(gh run list --repo "${{ github.repository }}" --workflow ci.yml --branch main \
+            --status success --limit 1 --json databaseId --jq '.[0].databaseId')
+          if [ -z "$run_id" ]; then echo "No green CI run on main yet"; exit 1; fi
+          echo "Using the model from CI run $run_id"
+          echo "run_id=$run_id" >> "$GITHUB_OUTPUT"
+      - uses: actions/download-artifact@v8
+        with:
+          name: model
+          path: model/
+          run-id: ${{ steps.ci.outputs.run_id }}
+          github-token: ${{ github.token }}
+
+      - name: Predict
+        env:
+          PICKUP: ${{ inputs.pickup }}
+          DROPOFF: ${{ inputs.dropoff }}
+          DISTANCE: ${{ inputs.distance }}
+          HOUR: ${{ inputs.hour }}
+          WEEKDAY: ${{ inputs.weekday }}
+        run: |
+          python src/predict.py --pickup "$PICKUP" --dropoff "$DROPOFF" \
+            --distance "$DISTANCE" --hour "$HOUR" --weekday "$WEEKDAY"

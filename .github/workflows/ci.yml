@@ -1,0 +1,109 @@
+name: CI
+
+# Run on every push to main, and on every pull request
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  # 1. Do the data cleaning and the API still work?
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.10"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - run: pip install ".[test]"
+      - run: pytest -v
+
+  # 2. Is the model still good enough? Runs only if the tests passed
+  model-check:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.10"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - run: pip install .
+      - run: python src/download_data.py 2019-10 2019-11
+      - run: python src/check_model.py
+      # Hand the model that passed to the next job
+      - uses: actions/upload-artifact@v7
+        with:
+          name: model
+          path: model/
+
+  # 3. Does the API image build and answer? Runs only if the model passed
+  docker:
+    needs: model-check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: model
+          path: model/
+      - run: docker build -t taxi-api .
+      # Send trips to the API and show the answers on the run's summary page
+      - name: Start the API and try some predictions
+        run: |
+          set -o pipefail
+          docker run -d --name api -p 8000:8000 taxi-api
+          for i in $(seq 1 30); do curl -sf http://localhost:8000/health && break; sleep 2; done
+
+          predict() {
+            minutes=$(curl -sf -X POST http://localhost:8000/predict \
+              -H "Content-Type: application/json" -d "$2" | jq -e .minutes)
+            echo "$1: $minutes minutes"
+            echo "| $1 | $minutes |" >> "$GITHUB_STEP_SUMMARY"
+          }
+
+          echo "### Predictions from the API in this Docker image" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Trip | Minutes |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|---|---|" >> "$GITHUB_STEP_SUMMARY"
+          predict "2.5 miles, Tuesday 8 AM" '{"PULocationID": 74, "DOLocationID": 75, "trip_distance": 2.5, "hour": 8, "weekday": 1}'
+          predict "8 miles, Tuesday 8 AM" '{"PULocationID": 74, "DOLocationID": 75, "trip_distance": 8, "hour": 8, "weekday": 1}'
+          predict "2.5 miles, Tuesday 3 AM" '{"PULocationID": 74, "DOLocationID": 75, "trip_distance": 2.5, "hour": 3, "weekday": 1}'
+          predict "2.5 miles, Sunday 8 AM" '{"PULocationID": 74, "DOLocationID": 75, "trip_distance": 2.5, "hour": 8, "weekday": 6}'
+      - name: Show the API logs if something failed
+        if: failure()
+        run: docker logs api
+
+  # 4. Ship it to the live API on Render.
+  #    Only for pushes to main, and only if all three checks passed
+  deploy:
+    needs: docker
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    concurrency: deploy # one deploy at a time, never two at once
+    permissions:
+      contents: read
+      packages: write # lets this job push the image to GitHub's registry (ghcr.io)
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: model
+          path: model/
+      - name: Build the image and push it to GitHub's registry
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }} # made by GitHub for every run, nothing to set up
+        run: |
+          IMAGE="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/taxi-api"   # ,, = lowercase, registry names must be
+          VERSION=$(cat model/version.txt)
+          echo "$GH_TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          docker build --provenance=false --sbom=false -t "$IMAGE:$VERSION" -t "$IMAGE:latest" \
+            --label "org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}" .
+          docker push --all-tags "$IMAGE"
+          echo "IMAGE=$IMAGE:$VERSION" >> "$GITHUB_ENV"
+      - run: python3 deploy/deploy_render.py
+        env:
+          RENDER_DEPLOY_HOOK: ${{ secrets.RENDER_DEPLOY_HOOK }} # secret: anyone with it can deploy
+          RENDER_URL: ${{ vars.RENDER_URL }} # variable, like https://taxi-api-xxxx.onrender.com
